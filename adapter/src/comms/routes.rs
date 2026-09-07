@@ -69,6 +69,7 @@ impl Router {
                 // round-trip inside the GBA's ~800us deadline), THEN fake the completion
                 // + clock-change locally as before so timing is met. Must forward BEFORE
                 // async_ack, which overwrites self.wap.packet.
+                crate::uart_link::send32(req.raw()); // also forward the 0x25 slot to the ESP32
                 crate::serial_usb::send_only32(req.raw());
                 return self.wap.async_ack();
             }
@@ -81,6 +82,7 @@ impl Router {
             _ => {}
         };
 
+        crate::uart_link::send32(req.raw()); // mirror the outgoing slot to the ESP32
         let recv_size = crate::serial_usb::transfer32(req.raw(), res_buf);
         let res = &res_buf[..recv_size];
 

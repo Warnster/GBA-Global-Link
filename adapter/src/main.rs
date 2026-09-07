@@ -13,6 +13,7 @@
 #![no_main]
 
 mod serial_usb;
+mod uart_link;
 
 mod comms;
 use comms::{Router, Spi};
@@ -105,13 +106,15 @@ fn main() -> ! {
     let uart_rx = pins.gpio1.into_function::<hal::gpio::FunctionUart>();
     let (g2, g3, g4, g5) = (pins.gpio2, pins.gpio3, pins.gpio4, pins.gpio5);
 
-    // UART0 to the ESP32: GP0 = TX, GP1 = RX, 115200 8N1.
-    let mut uart = UartPeripheral::new(pac.UART0, (uart_tx, uart_rx), &mut pac.RESETS)
+    // UART0 to the ESP32: GP0 = TX, GP1 = RX, 115200 8N1. Handed to uart_link so core1
+    // (the Router) can forward RFU slots to the ESP32 alongside USB.
+    let uart = UartPeripheral::new(pac.UART0, (uart_tx, uart_rx), &mut pac.RESETS)
         .enable(
             UartConfig::new(115_200.Hz(), DataBits::Eight, None, StopBits::One),
             clocks.peripheral_clock.freq(),
         )
         .unwrap();
+    uart_link::init(uart);
 
     // Timer for the 1 Hz heartbeat.
     let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
@@ -135,8 +138,9 @@ fn main() -> ! {
         Router::new(spi).run();
     });
 
-    // Announce once, then heartbeat every ~1s over the UART to the ESP32.
-    uart.write_full_blocking(b"GBA-FW up\r\n");
+    // Announce once, then heartbeat every ~1s over the UART (liveness even with no GBA
+    // attached; the real RFU slots are forwarded from core1 via uart_link::send32).
+    uart_link::send(b"GBA-FW up\r\n");
     let mut last = timer.get_counter().ticks();
     let mut n: u32 = 0;
     loop {
@@ -146,7 +150,7 @@ fn main() -> ! {
             last = now;
             let mut hb = HbBuf { buf: [0; 40], len: 0 };
             let _ = write!(hb, "GBA-FW hb #{}\r\n", n);
-            uart.write_full_blocking(&hb.buf[..hb.len]);
+            uart_link::send(&hb.buf[..hb.len]);
             n = n.wrapping_add(1);
         }
     }

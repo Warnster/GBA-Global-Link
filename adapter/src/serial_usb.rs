@@ -56,6 +56,15 @@ impl<'d> SerialUsb<'d> {
             }
         }
     }
+
+    /// Queue bytes to the USB TX buffer and return immediately - no poll wait, no
+    /// reply read. Core 0's `poll()` loop flushes the buffer. Used for fire-and-forget
+    /// forwards (the child's outgoing 0x25 slot) that must not block the GBA's ~800us
+    /// inter-transfer deadline. Best-effort single write; at 60 Hz with <=16-byte slots
+    /// the TX buffer (drained continuously by core 0) does not overflow in practice.
+    fn send_only(&mut self, data: &[u8]) {
+        let _ = self.serial.write(data);
+    }
 }
 
 static USB_BUS: StaticCell<UsbBusAllocator<usb::UsbBus>> = StaticCell::new();
@@ -89,4 +98,17 @@ pub fn transfer32(send: &[u32], recv: &mut [u32]) -> usize {
     let recv = transmute_to_bytes_mut(recv);
     let bytes_received = transfer(send, recv);
     bytes_received / 4
+}
+
+/// Fire-and-forget: queue `data` (u32 LE words) to the host without waiting for a reply.
+/// The Pico does NOT read a response for these, so the host must NOT send one.
+pub fn send_only32(data: &[u32]) {
+    critical_section::with(|cs| {
+        let bytes = transmute_to_bytes(data);
+        SERIAL_USB
+            .get()
+            .unwrap()
+            .borrow_ref_mut(cs)
+            .send_only(bytes);
+    });
 }

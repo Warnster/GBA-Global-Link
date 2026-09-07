@@ -1,0 +1,9 @@
+# Pinned by gba-switch-bridge project.
+# Upstream GBA-Global-Link (last commit 2024-01-22) uses rustc code-size flags
+# (-C inline-threshold, -C no-vectorize-loops) that were removed from current
+# stable. 1.76.0 (2024-02) is contemporary with the code and still accepts them,
+# so the produced firmware matches what upstream would have built.
+[toolchain]
+channel = "1.76.0"
+components = ["rust-src", "llvm-tools"]
+targets = ["thumbv6m-none-eabi"]

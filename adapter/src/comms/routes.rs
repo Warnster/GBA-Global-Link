@@ -61,9 +61,20 @@ impl Router {
 
         match command {
             Command::SendDataAndWait => {
+                // 0x25 = ID_DATA_TX_AND_CHANGE_REQ. During a connected trade the GBA is
+                // the clock-slave child and its outgoing 14-byte slot rides HERE
+                // (pokefirered librfu: STWI_send_DataTxAndChangeREQ copies the payload).
+                // The old code async_ack'd locally and DROPPED those bytes. Forward the
+                // slot to the host first (fire-and-forget: we cannot wait a USB/Switch
+                // round-trip inside the GBA's ~800us deadline), THEN fake the completion
+                // + clock-change locally as before so timing is met. Must forward BEFORE
+                // async_ack, which overwrites self.wap.packet.
+                crate::serial_usb::send_only32(req.raw());
                 return self.wap.async_ack();
             }
             Command::ReceiveDataAndWait => {
+                // 0x27 = ID_MS_CHANGE_REQ: payload-less clock master/slave change.
+                // Nothing to forward; keep handling locally.
                 return self.wap.async_ack();
             }
             // Forward all other requests to the web app

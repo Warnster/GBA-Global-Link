@@ -6,7 +6,15 @@ pub fn login(spi: &mut Spi) {
     let mut tx = INITIAL_LOGIN_TX;
 
     loop {
-        tx = match spi.transfer_u32(tx) {
+        // Clear any stale clock-timeout flag, attempt one exchange, and retry if it timed
+        // out (GBA not clocking yet). This lets the adapter re-sync on its own after the
+        // GBA is power-cycled, instead of needing the Pico power-cycled too.
+        spi.reset();
+        let rx = spi.transfer_u32(tx);
+        if spi.reset_requested() {
+            continue;
+        }
+        tx = match rx {
             0x0000494E => 0x494EB6B1,
             0xFFFF494E => 0x494EB6B1,
             0x7FFF494E => 0x494EB6B1,

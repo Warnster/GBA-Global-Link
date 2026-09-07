@@ -7,6 +7,14 @@ type DefaultPin<P> = Pin<P, FunctionNull, PullDown>;
 type Input<P> = Pin<P, FunctionSio<SioInput>, PullDown>;
 type Output<P> = Pin<P, FunctionSio<SioOutput>, PullDown>;
 
+/// Spin-loop iteration cap before we assume the GBA's clock has stopped (powered off /
+/// link dropped). Without it a stalled clock hangs core 1 forever and needs a physical
+/// power-cycle. Generous: well above the ~16 ms between normal per-VBlank transactions,
+/// and the GBA drops the link itself after ~3 s. Iterations->time depends on the built
+/// loop, so TUNE ON HARDWARE if it either false-resets a live session (raise it) or
+/// recovers too slowly (lower it).
+const CLK_TIMEOUT: u32 = 20_000_000;
+
 pub struct Spi {
     p_clk: Input<peris::Gpio2>,
     p_tx: Output<peris::Gpio3>,
@@ -35,6 +43,10 @@ impl Spi {
         self.reset_requested = false;
     }
 
+    pub fn request_reset(&mut self) {
+        self.reset_requested = true;
+    }
+
     #[inline(never)]
     pub fn reset_requested(&self) -> bool {
         self.reset_requested
@@ -56,9 +68,15 @@ impl Spi {
     }
 
     fn transfer_bit(&mut self, bit: u8) -> u8 {
+        let mut timeout = 0u32;
         while self.p_clk.is_high().unwrap_or_default() {
             if self.p_reset.is_high().unwrap_or_default() {
                 self.reset_requested = true;
+            }
+            timeout += 1;
+            if timeout > CLK_TIMEOUT {
+                self.reset_requested = true;
+                return 0;
             }
         }
         if bit == 0 {
@@ -66,7 +84,14 @@ impl Spi {
         } else {
             let _ = self.p_tx.set_high();
         }
-        while self.p_clk.is_low().unwrap_or_default() {}
+        timeout = 0;
+        while self.p_clk.is_low().unwrap_or_default() {
+            timeout += 1;
+            if timeout > CLK_TIMEOUT {
+                self.reset_requested = true;
+                return 0;
+            }
+        }
         self.p_rx.is_high().unwrap_or_default() as u8
     }
 
@@ -111,6 +136,11 @@ impl Spi {
         for bit in bits {
             rx <<= 1;
             rx |= self.transfer_bit(bit) as u32;
+            // Bail the instant a clock-timeout flags a reset, so a dead link is caught in
+            // ~1 timeout rather than grinding through all 32 bits.
+            if self.reset_requested {
+                break;
+            }
         }
 
         rx

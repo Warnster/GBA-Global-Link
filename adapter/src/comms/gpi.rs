@@ -3,6 +3,10 @@ use super::result::SendResult;
 use super::spi::Spi;
 use crate::unwrap_send;
 
+/// Same purpose as spi::CLK_TIMEOUT: don't let a powered-off GBA hang core 1 waiting on
+/// the ready line here. On timeout we flag a reset (caught by the next transfer).
+const ACK_TIMEOUT: u32 = 20_000_000;
+
 #[inline(never)]
 fn ack_recv(spi: &mut Spi) {
     // Make sure it's low, just to be safe
@@ -11,7 +15,14 @@ fn ack_recv(spi: &mut Spi) {
     spi.p_tx_set_high();
     spi.p_tx_set_high();
     spi.p_tx_set_high();
-    while spi.p_rx_is_low() {}
+    let mut timeout = 0u32;
+    while spi.p_rx_is_low() {
+        timeout += 1;
+        if timeout > ACK_TIMEOUT {
+            spi.request_reset();
+            break;
+        }
+    }
 }
 
 #[inline(never)]

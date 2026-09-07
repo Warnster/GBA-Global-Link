@@ -37,6 +37,29 @@ use rp_pico::hal::multicore::{Multicore, Stack};
 // USB Device support
 use usb_device::class_prelude::*;
 
+// UART to the ESP32 (Switch-side) — heartbeat / relay link on GP0/GP1.
+use core::fmt::Write as _;
+use fugit::RateExtU32;
+use rp_pico::hal::uart::{DataBits, StopBits, UartConfig, UartPeripheral};
+use rp_pico::hal::Clock as _;
+
+/// Tiny no_std buffer for building a heartbeat line without alloc.
+struct HbBuf {
+    buf: [u8; 40],
+    len: usize,
+}
+impl core::fmt::Write for HbBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 
 /// Entry point to our bare-metal application.
@@ -77,6 +100,22 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
+    // Split out the pins we need before core1 takes the GBA-link ones (GP2-5).
+    let uart_tx = pins.gpio0.into_function::<hal::gpio::FunctionUart>();
+    let uart_rx = pins.gpio1.into_function::<hal::gpio::FunctionUart>();
+    let (g2, g3, g4, g5) = (pins.gpio2, pins.gpio3, pins.gpio4, pins.gpio5);
+
+    // UART0 to the ESP32: GP0 = TX, GP1 = RX, 115200 8N1.
+    let mut uart = UartPeripheral::new(pac.UART0, (uart_tx, uart_rx), &mut pac.RESETS)
+        .enable(
+            UartConfig::new(115_200.Hz(), DataBits::Eight, None, StopBits::One),
+            clocks.peripheral_clock.freq(),
+        )
+        .unwrap();
+
+    // Timer for the 1 Hz heartbeat.
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
     let mut mc = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
     let cores = mc.cores();
     let core1 = &mut cores[1];
@@ -92,11 +131,23 @@ fn main() -> ! {
     serial_usb::init(usb_bus);
 
     let _ = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {
-        let spi = Spi::new(pins.gpio2, pins.gpio3, pins.gpio4, pins.gpio5);
+        let spi = Spi::new(g2, g3, g4, g5);
         Router::new(spi).run();
     });
 
+    // Announce once, then heartbeat every ~1s over the UART to the ESP32.
+    uart.write_full_blocking(b"GBA-FW up\r\n");
+    let mut last = timer.get_counter().ticks();
+    let mut n: u32 = 0;
     loop {
         serial_usb::poll();
+        let now = timer.get_counter().ticks();
+        if now.wrapping_sub(last) >= 1_000_000 {
+            last = now;
+            let mut hb = HbBuf { buf: [0; 40], len: 0 };
+            let _ = write!(hb, "GBA-FW hb #{}\r\n", n);
+            uart.write_full_blocking(&hb.buf[..hb.len]);
+            n = n.wrapping_add(1);
+        }
     }
 }

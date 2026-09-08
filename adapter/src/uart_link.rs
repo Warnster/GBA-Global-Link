@@ -40,3 +40,16 @@ pub fn send(data: &[u8]) {
 pub fn send32(data: &[u32]) {
     send(transmute_to_bytes(data));
 }
+
+/// Non-blocking read of whatever bytes the ESP32 has sent. Returns the count read into
+/// `buf` (0 if none). Used by core0 to pull the ESP32->Pico relay stream (peer presence /
+/// received trade slots) and feed the frame parser in `relay`.
+pub fn recv(buf: &mut [u8]) -> usize {
+    critical_section::with(|cs| {
+        if let Some(u) = UART.get() {
+            u.borrow_ref_mut(cs).read_raw(buf).unwrap_or(0)
+        } else {
+            0
+        }
+    })
+}

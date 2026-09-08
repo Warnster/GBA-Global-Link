@@ -36,6 +36,10 @@ pub struct Router {
     /// GetSomeValue (0x13) alternates between two values on successive calls, matching a
     /// real adapter (upstream web-app router.ts + pico_host.py PeerSim).
     some_value_high: bool,
+    /// Connect handshake state for the relayed peer: report "connecting" a few polls, then
+    /// "connected". Matches PeerSim's connect_polls model.
+    connecting_polls: u8,
+    connected: bool,
 }
 
 impl Router {
@@ -43,6 +47,8 @@ impl Router {
         Self {
             wap: Wap::new(spi),
             some_value_high: false,
+            connecting_polls: 0,
+            connected: false,
         }
     }
 
@@ -51,6 +57,8 @@ impl Router {
     }
 
     fn reset(&mut self) {
+        self.connecting_polls = 0;
+        self.connected = false;
         self.wap.reset();
     }
 
@@ -61,10 +69,10 @@ impl Router {
     /// which is what caused the connection errors (the old code waited on a USB reply that,
     /// with no Linux/Switch answering, never came).
     ///
-    /// Writes reply words into `out` and returns the count. Peer/trade DATA (broadcast peer
-    /// lists, connect ids, received slots) will be served here from data the Switch sends
-    /// over the ESP32 UART once the UART-RX relay (stage 2) is wired in; until then these
-    /// return empty = "solo, no peers", which is correct standalone behaviour.
+    /// Writes reply words into `out` and returns the count. Peer/trade DATA now comes from the
+    /// ESP32 (Switch side) over the UART relay (`crate::relay`): when the Switch is present the
+    /// relay reports a peer, so BroadcastReadPoll lists it and the GBA can connect. With no
+    /// relayed peer these return empty = "solo, no peers", so standalone entry still works.
     fn local_respond(&mut self, command: Command, out: &mut [u32]) -> usize {
         match command {
             Command::GetSomeValue => {
@@ -78,14 +86,32 @@ impl Router {
                 out[0] = 0x000000ff;
                 1
             }
-            // Peer-discovery / connection commands: no peers while standalone. Returning an
-            // empty list is "nobody here yet", so the GBA stays in the room waiting instead
-            // of erroring. (Stage 2 fills these from the Switch via UART.)
-            Command::BroadcastReadPoll
-            | Command::BroadcastReadEnd
-            | Command::Connect
-            | Command::IsConnecting
-            | Command::FinishConnecting => 0,
+            // Peer discovery: list the Switch-relayed peer if present (peer_id + 6-word beacon),
+            // else empty ("nobody here"). The GBA infers peer count from the word count / 7.
+            Command::BroadcastReadPoll | Command::BroadcastReadEnd => crate::relay::get_peer(out),
+            Command::Connect => {
+                // Begin connecting to the relayed peer (if any).
+                self.connecting_polls = 0;
+                self.connected = false;
+                0
+            }
+            Command::IsConnecting | Command::FinishConnecting => match crate::relay::peer_id() {
+                Some(id) => {
+                    if !self.connected && self.connecting_polls < 3 {
+                        self.connecting_polls += 1;
+                        out[0] = 0x01000000; // still connecting
+                        1
+                    } else {
+                        self.connected = true;
+                        out[0] = id; // connected: report the peer id
+                        1
+                    }
+                }
+                None => 0,
+            },
+            // Received trade data from the Switch (relayed), served to the GBA. 0x26 ReceiveData
+            // and 0x28 ReceiveDataAndWaitResponse both pull the latest relayed slot.
+            Command::ReceiveData | Command::ReceiveDataAndWaitResponse => crate::relay::take_slot(out),
             // Everything else (Init/Setup/Broadcast/StartHost/AcceptConnections/…): a bare
             // success ack with no data, same as a real adapter acknowledging the command.
             _ => 0,

@@ -14,6 +14,7 @@
 
 mod serial_usb;
 mod uart_link;
+mod relay;
 
 mod comms;
 use comms::{Router, Spi};
@@ -174,6 +175,8 @@ fn main() -> ! {
         serial_usb::poll();
         // Software BOOTSEL: host sends 'B' over USB serial to reflash without the button.
         serial_usb::check_bootsel();
+        // Pull the ESP32->Pico relay stream (peer presence / received slots from the Switch).
+        relay::poll();
         let now = timer.get_counter().ticks();
 
         // Feed the watchdog until the first SPI activity; after that, only while the heartbeat

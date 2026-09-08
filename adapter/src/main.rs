@@ -40,7 +40,10 @@ use usb_device::class_prelude::*;
 
 // UART to the ESP32 (Switch-side) — heartbeat / relay link on GP0/GP1.
 use core::fmt::Write as _;
-use fugit::RateExtU32;
+use cortex_m::prelude::{
+    _embedded_hal_watchdog_Watchdog as _, _embedded_hal_watchdog_WatchdogEnable as _,
+};
+use fugit::{ExtU32, RateExtU32};
 use rp_pico::hal::uart::{DataBits, StopBits, UartConfig, UartPeripheral};
 use rp_pico::hal::Clock as _;
 
@@ -143,9 +146,61 @@ fn main() -> ! {
     uart_link::send(b"GBA-FW up\r\n");
     let mut last = timer.get_counter().ticks();
     let mut n: u32 = 0;
+    let mut last_dump = last;
+
+    // Link-drop recovery via hardware watchdog (replaces the per-bit CLK_TIMEOUT that broke
+    // login timing). We feed it below ONLY while core 1's SPI heartbeat keeps advancing, so
+    // a hung transfer_bit (frozen clock: link dropped / room comm error) stops the feed and
+    // the chip reboots + re-logins. During a live session (a transfer every ~16ms) it is fed
+    // continuously, well inside the window, so no spurious resets.
+    //
+    // The tolerated no-clock gap is FEED_WINDOW_US; a real session clocks every ~16ms, but
+    // the Union Room has brief legitimate pauses (menu transitions, host<->search cycling)
+    // that must NOT reboot us and drop a live link. 1.2s was too aggressive and dropped an
+    // in-room connection, so this is ~5s: forgiving of pauses, still recovers a truly dead
+    // link before a human would (and the GBA itself only gives up after ~3s).
+    watchdog.pause_on_debug(false);
+    watchdog.start(1_500.millis());
+    let mut spi_hb = comms::Spi::tx_count();
+    let mut spi_hb_time = last;
+    // Only gate the watchdog on the SPI heartbeat AFTER we've seen the first transfer. Before
+    // that (GBA idle / console off / not yet in wireless) we feed unconditionally, so an idle
+    // link doesn't reboot-loop the Pico — it just waits. A drop mid-session still recovers:
+    // once armed, a frozen clock stops the heartbeat and the watchdog fires; the reboot
+    // returns here disarmed, so it waits quietly again until the GBA next clocks.
+    let mut wd_armed = false;
+
     loop {
         serial_usb::poll();
+        // Software BOOTSEL: host sends 'B' over USB serial to reflash without the button.
+        serial_usb::check_bootsel();
         let now = timer.get_counter().ticks();
+
+        // Feed the watchdog until the first SPI activity; after that, only while the heartbeat
+        // keeps advancing. A hung/frozen clock mid-session stops it and lets the watchdog fire.
+        let hb = comms::Spi::tx_count();
+        if hb != spi_hb {
+            spi_hb = hb;
+            spi_hb_time = now;
+            wd_armed = true;
+        }
+        const FEED_WINDOW_US: u64 = 4_000_000; // tolerate up to ~4s of no clock (+~1.5s wd)
+        if !wd_armed || now.wrapping_sub(spi_hb_time) < FEED_WINDOW_US {
+            watchdog.feed();
+        }
+        // DIAGNOSTIC: dump the login handshake rx log over USB every ~300ms
+        if now.wrapping_sub(last_dump) >= 300_000 {
+            last_dump = now;
+            let mut pkt = [0u32; 10];
+            pkt[0] = 0x1061_1061; // login-log magic
+            unsafe {
+                pkt[1] = comms::login::LOGIN_N;
+                for k in 0..8 {
+                    pkt[2 + k] = comms::login::LOGIN_RX[k];
+                }
+            }
+            serial_usb::send_only32(&pkt);
+        }
         if now.wrapping_sub(last) >= 1_000_000 {
             last = now;
             let mut hb = HbBuf { buf: [0; 40], len: 0 };

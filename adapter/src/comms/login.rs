@@ -2,6 +2,12 @@ use super::spi::Spi;
 
 const INITIAL_LOGIN_TX: u32 = 0x00;
 
+// DIAGNOSTIC: record the rx values the GBA sends during login so core0 can dump them over
+// USB. Lets us see whether the handshake advances (0x..494E -> B6B1 -> ... -> 8001) or the
+// Pico is mis-reading the line (garbage = SPI timing/signal issue).
+pub static mut LOGIN_RX: [u32; 16] = [0; 16];
+pub static mut LOGIN_N: u32 = 0;
+
 pub fn login(spi: &mut Spi) {
     let mut tx = INITIAL_LOGIN_TX;
 
@@ -13,6 +19,11 @@ pub fn login(spi: &mut Spi) {
         let rx = spi.transfer_u32(tx);
         if spi.reset_requested() {
             continue;
+        }
+        unsafe {
+            let i = (LOGIN_N as usize) % 16;
+            LOGIN_RX[i] = rx;
+            LOGIN_N = LOGIN_N.wrapping_add(1);
         }
         tx = match rx {
             0x0000494E => 0x494EB6B1,

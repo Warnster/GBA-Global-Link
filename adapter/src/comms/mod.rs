@@ -1,5 +1,5 @@
 mod gpi;
-mod login;
+pub mod login;
 mod macros;
 mod packet;
 mod result;

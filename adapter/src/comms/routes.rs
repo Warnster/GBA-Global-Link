@@ -4,8 +4,6 @@ use super::wap::Wap;
 use crate::unwrap_send;
 use num_enum::{FromPrimitive, IntoPrimitive};
 
-const WEB_APP_MAGIC: u32 = 0xc0dec0de;
-
 #[derive(IntoPrimitive, FromPrimitive, PartialEq)]
 #[repr(u8)]
 enum Command {
@@ -35,11 +33,17 @@ enum Command {
 
 pub struct Router {
     wap: Wap,
+    /// GetSomeValue (0x13) alternates between two values on successive calls, matching a
+    /// real adapter (upstream web-app router.ts + pico_host.py PeerSim).
+    some_value_high: bool,
 }
 
 impl Router {
     pub fn new(spi: Spi) -> Self {
-        Self { wap: Wap::new(spi) }
+        Self {
+            wap: Wap::new(spi),
+            some_value_high: false,
+        }
     }
 
     fn login(&mut self) {
@@ -50,7 +54,45 @@ impl Router {
         self.wap.reset();
     }
 
-    fn handle_req(&mut self, res_buf: &mut [u32]) -> SendResult<()> {
+    /// Answer a post-login adapter command LOCALLY, like a real Wireless Adapter does. This
+    /// is what lets the GBA enter the Union Room with NO peer/Switch connected — the default
+    /// hardware behaviour: control commands succeed, peer-discovery reports "no peers", and
+    /// the player simply waits in the room. Crucially it NEVER blocks on an external host,
+    /// which is what caused the connection errors (the old code waited on a USB reply that,
+    /// with no Linux/Switch answering, never came).
+    ///
+    /// Writes reply words into `out` and returns the count. Peer/trade DATA (broadcast peer
+    /// lists, connect ids, received slots) will be served here from data the Switch sends
+    /// over the ESP32 UART once the UART-RX relay (stage 2) is wired in; until then these
+    /// return empty = "solo, no peers", which is correct standalone behaviour.
+    fn local_respond(&mut self, command: Command, out: &mut [u32]) -> usize {
+        match command {
+            Command::GetSomeValue => {
+                // 0x13: alternate 0x0200abcd / 0x00000000.
+                self.some_value_high = !self.some_value_high;
+                out[0] = if self.some_value_high { 0x0200abcd } else { 0x00000000 };
+                1
+            }
+            Command::Unknown => {
+                // 0x11: adapter returns 0x000000ff.
+                out[0] = 0x000000ff;
+                1
+            }
+            // Peer-discovery / connection commands: no peers while standalone. Returning an
+            // empty list is "nobody here yet", so the GBA stays in the room waiting instead
+            // of erroring. (Stage 2 fills these from the Switch via UART.)
+            Command::BroadcastReadPoll
+            | Command::BroadcastReadEnd
+            | Command::Connect
+            | Command::IsConnecting
+            | Command::FinishConnecting => 0,
+            // Everything else (Init/Setup/Broadcast/StartHost/AcceptConnections/…): a bare
+            // success ack with no data, same as a real adapter acknowledging the command.
+            _ => 0,
+        }
+    }
+
+    fn handle_req(&mut self, _res_buf: &mut [u32]) -> SendResult<()> {
         let req = unwrap_send!(self.wap.recv_req());
         let command = Command::from(req.command());
 
@@ -59,39 +101,30 @@ impl Router {
             return SendResult::Data(());
         }
 
+        // Mirror every outgoing command to the ESP32 (Switch side) and to USB for logging.
+        // Both are fire-and-forget: a real adapter answers within the GBA's ~800us deadline,
+        // so we must NOT wait on any external round-trip here.
+        crate::uart_link::send32(req.raw());
+        crate::serial_usb::send_only32(req.raw());
+
         match command {
             Command::SendDataAndWait => {
-                // 0x25 = ID_DATA_TX_AND_CHANGE_REQ. During a connected trade the GBA is
-                // the clock-slave child and its outgoing 14-byte slot rides HERE
-                // (pokefirered librfu: STWI_send_DataTxAndChangeREQ copies the payload).
-                // The old code async_ack'd locally and DROPPED those bytes. Forward the
-                // slot to the host first (fire-and-forget: we cannot wait a USB/Switch
-                // round-trip inside the GBA's ~800us deadline), THEN fake the completion
-                // + clock-change locally as before so timing is met. Must forward BEFORE
-                // async_ack, which overwrites self.wap.packet.
-                crate::uart_link::send32(req.raw()); // also forward the 0x25 slot to the ESP32
-                crate::serial_usb::send_only32(req.raw());
-                return self.wap.async_ack();
+                // 0x25 = ID_DATA_TX_AND_CHANGE_REQ: the child's outgoing 14-byte trade slot
+                // rides here (already forwarded above). Fake the completion + clock-change
+                // locally so the GBA's timing is met.
+                self.wap.async_ack()
             }
             Command::ReceiveDataAndWait => {
                 // 0x27 = ID_MS_CHANGE_REQ: payload-less clock master/slave change.
-                // Nothing to forward; keep handling locally.
-                return self.wap.async_ack();
+                self.wap.async_ack()
             }
-            // Forward all other requests to the web app
-            _ => {}
-        };
-
-        crate::uart_link::send32(req.raw()); // mirror the outgoing slot to the ESP32
-        let recv_size = crate::serial_usb::transfer32(req.raw(), res_buf);
-        let res = &res_buf[..recv_size];
-
-        if recv_size == 0 || res[0] != WEB_APP_MAGIC {
-            return self.wap.reply_req(&[]);
+            // All other commands: answer locally, immediately (no blocking on USB/Switch).
+            _ => {
+                let mut reply = [0u32; 8];
+                let n = self.local_respond(command, &mut reply);
+                self.wap.reply_req(&reply[..n])
+            }
         }
-
-        let wap_res = &res[1..];
-        self.wap.reply_req(wap_res)
     }
 
     pub fn run(&mut self) -> ! {

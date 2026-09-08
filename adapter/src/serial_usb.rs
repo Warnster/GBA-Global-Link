@@ -81,6 +81,28 @@ pub fn poll() {
     })
 }
 
+/// Software BOOTSEL: if the host has sent the byte `B` (0x42) over the USB serial port,
+/// reboot into the RP2040 mass-storage bootloader so firmware can be reflashed WITHOUT
+/// the physical button. Call once per core-0 loop iteration, right after `poll()`.
+/// `reset_to_usb_boot` never returns. Non-`B` bytes are drained and ignored.
+pub fn check_bootsel() {
+    critical_section::with(|cs| {
+        let mut g = SERIAL_USB.get().unwrap().borrow_ref_mut(cs);
+        let mut buf = [0u8; 16];
+        let n = g.serial.read(&mut buf).unwrap_or_default();
+        if buf[..n].contains(&b'B') {
+            // Disable the watchdog first, or its ~1.5s timer would reset the chip back out
+            // of BOOTSEL mid-flash. Safe raw access: we're about to reboot anyway.
+            unsafe { &*rp_pico::hal::pac::WATCHDOG::ptr() }
+                .ctrl
+                .modify(|_, w| w.enable().clear_bit());
+            // gpio_activity_pin_mask = 0 (no LED), disable_interface_mask = 0 (both
+            // mass-storage + PICOBOOT enabled) — standard "appear as RPI-RP2 drive".
+            rp_pico::hal::rom_data::reset_to_usb_boot(0, 0);
+        }
+    })
+}
+
 /// Waits until data is received, unless a recv buf of length 0 is given.
 pub fn transfer(send: &[u8], recv: &mut [u8]) -> usize {
     critical_section::with(|cs| {

@@ -175,8 +175,10 @@ fn main() -> ! {
         serial_usb::poll();
         // Software BOOTSEL: host sends 'B' over USB serial to reflash without the button.
         serial_usb::check_bootsel();
-        // Pull the ESP32->Pico relay stream (peer presence / received slots from the Switch).
-        relay::poll();
+        // NOTE: the ESP32->Pico relay is polled on CORE 1 (the Router), NOT here. Reading the
+        // UART on core0 held the shared critical-section lock long enough to blow core1's tight
+        // per-command GBA deadline (instant Union Room comm error). Core1 owns the UART (it
+        // already does send32) and reads it between GBA commands where there is slack.
         let now = timer.get_counter().ticks();
 
         // Feed the watchdog until the first SPI activity; after that, only while the heartbeat

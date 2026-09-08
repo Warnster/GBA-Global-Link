@@ -164,6 +164,10 @@ impl Router {
                 if self.handle_req(&mut res_buf) == SendResult::Reset {
                     break;
                 };
+                // Pull the ESP32->Pico relay stream (peer presence / received slots) here on
+                // core1, between GBA commands, so UART access never contends with core1's own
+                // timing-critical SPI path or with core0.
+                crate::relay::poll();
             }
         }
     }

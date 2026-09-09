@@ -193,19 +193,9 @@ fn main() -> ! {
         if !wd_armed || now.wrapping_sub(spi_hb_time) < FEED_WINDOW_US {
             watchdog.feed();
         }
-        // DIAGNOSTIC: dump the login handshake rx log over USB every ~300ms
-        if now.wrapping_sub(last_dump) >= 300_000 {
-            last_dump = now;
-            let mut pkt = [0u32; 10];
-            pkt[0] = 0x1061_1061; // login-log magic
-            unsafe {
-                pkt[1] = comms::login::LOGIN_N;
-                for k in 0..8 {
-                    pkt[2 + k] = comms::login::LOGIN_RX[k];
-                }
-            }
-            serial_usb::send_only32(&pkt);
-        }
+        // (login-log USB dump removed: send_only32 must be core1-only now so the USB TX ring
+        // stays single-producer/SPSC. The relay still logs via uart_link heartbeats.)
+        let _ = last_dump;
         if now.wrapping_sub(last) >= 1_000_000 {
             last = now;
             let mut hb = HbBuf { buf: [0; 40], len: 0 };

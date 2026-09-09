@@ -86,21 +86,29 @@ pub fn poll() {
 /// the physical button. Call once per core-0 loop iteration, right after `poll()`.
 /// `reset_to_usb_boot` never returns. Non-`B` bytes are drained and ignored.
 pub fn check_bootsel() {
-    critical_section::with(|cs| {
+    // Read whatever the host (PC) sent, then run it through the relay frame parser so the PC
+    // can drive the GBA<->Switch relay over the Pico's USB (peer beacon + received slots).
+    // relay::feed returns true only for a lone `B` (0x42) OUTSIDE any AA55 frame = BOOTSEL,
+    // so relay payloads containing 0x42 never false-trigger a reflash. Read then feed (no
+    // nested critical sections).
+    let mut buf = [0u8; 64];
+    let n = critical_section::with(|cs| {
         let mut g = SERIAL_USB.get().unwrap().borrow_ref_mut(cs);
-        let mut buf = [0u8; 16];
-        let n = g.serial.read(&mut buf).unwrap_or_default();
-        if buf[..n].contains(&b'B') {
-            // Disable the watchdog first, or its ~1.5s timer would reset the chip back out
-            // of BOOTSEL mid-flash. Safe raw access: we're about to reboot anyway.
-            unsafe { &*rp_pico::hal::pac::WATCHDOG::ptr() }
-                .ctrl
-                .modify(|_, w| w.enable().clear_bit());
-            // gpio_activity_pin_mask = 0 (no LED), disable_interface_mask = 0 (both
-            // mass-storage + PICOBOOT enabled) — standard "appear as RPI-RP2 drive".
-            rp_pico::hal::rom_data::reset_to_usb_boot(0, 0);
-        }
-    })
+        g.serial.read(&mut buf).unwrap_or_default()
+    });
+    if n == 0 {
+        return;
+    }
+    if crate::relay::feed(&buf[..n]) {
+        // Disable the watchdog first, or its ~1.5s timer would reset the chip back out
+        // of BOOTSEL mid-flash. Safe raw access: we're about to reboot anyway.
+        unsafe { &*rp_pico::hal::pac::WATCHDOG::ptr() }
+            .ctrl
+            .modify(|_, w| w.enable().clear_bit());
+        // gpio_activity_pin_mask = 0 (no LED), disable_interface_mask = 0 (both
+        // mass-storage + PICOBOOT enabled) — standard "appear as RPI-RP2 drive".
+        rp_pico::hal::rom_data::reset_to_usb_boot(0, 0);
+    }
 }
 
 /// Waits until data is received, unless a recv buf of length 0 is given.

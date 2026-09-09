@@ -140,6 +140,25 @@ pub fn poll() {
     });
 }
 
+/// core0: feed bytes from the PC-over-USB relay stream through the frame parser. Returns
+/// true if a software-BOOTSEL was requested (a lone `B` = 0x42 while the parser is idle;
+/// bytes inside an AA55 frame never trigger it, so relay payloads are safe). Lets the PC
+/// drive the relay over the Pico's USB instead of the ESP UART.
+pub fn feed(buf: &[u8]) -> bool {
+    let mut bootsel = false;
+    critical_section::with(|cs| {
+        let mut r = RELAY.borrow_ref_mut(cs);
+        for &b in buf {
+            if r.st == 0 && b == 0x42 {
+                bootsel = true; // 'B' outside any frame -> BOOTSEL, not relay data
+                continue;
+            }
+            r.byte(b);
+        }
+    });
+    bootsel
+}
+
 /// core1 (Router): if a partner is present, write [peer_id, beacon(6)] into `out` and return
 /// the word count (7); otherwise 0 (= no peers).
 pub fn get_peer(out: &mut [u32]) -> usize {

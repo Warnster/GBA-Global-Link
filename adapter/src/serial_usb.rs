@@ -86,28 +86,17 @@ pub fn poll() {
 /// the physical button. Call once per core-0 loop iteration, right after `poll()`.
 /// `reset_to_usb_boot` never returns. Non-`B` bytes are drained and ignored.
 pub fn check_bootsel() {
-    // Read whatever the host (PC) sent, then run it through the relay frame parser so the PC
-    // can drive the GBA<->Switch relay over the Pico's USB (peer beacon + received slots).
-    // relay::feed returns true only for a lone `B` (0x42) OUTSIDE any AA55 frame = BOOTSEL,
-    // so relay payloads containing 0x42 never false-trigger a reflash. Read then feed (no
-    // nested critical sections).
+    // Forward the PC's USB bytes into the relay ring (parsed on core1 — NOT here on core0, which
+    // must not hold the relay critical-section or it starves core1's GBA SPI deadline). Software
+    // BOOTSEL is now an AA55 T_BOOTSEL frame handled by the relay parser, so a 0x42 in relay data
+    // can't false-trigger a reflash. Only the short SERIAL_USB read takes a lock (as before).
     let mut buf = [0u8; 64];
     let n = critical_section::with(|cs| {
         let mut g = SERIAL_USB.get().unwrap().borrow_ref_mut(cs);
         g.serial.read(&mut buf).unwrap_or_default()
     });
-    if n == 0 {
-        return;
-    }
-    if crate::relay::feed(&buf[..n]) {
-        // Disable the watchdog first, or its ~1.5s timer would reset the chip back out
-        // of BOOTSEL mid-flash. Safe raw access: we're about to reboot anyway.
-        unsafe { &*rp_pico::hal::pac::WATCHDOG::ptr() }
-            .ctrl
-            .modify(|_, w| w.enable().clear_bit());
-        // gpio_activity_pin_mask = 0 (no LED), disable_interface_mask = 0 (both
-        // mass-storage + PICOBOOT enabled) — standard "appear as RPI-RP2 drive".
-        rp_pico::hal::rom_data::reset_to_usb_boot(0, 0);
+    for &b in &buf[..n] {
+        crate::relay::usb_push(b);
     }
 }
 
